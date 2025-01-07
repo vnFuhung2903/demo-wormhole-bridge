@@ -5,16 +5,19 @@ import "./interfaces/IWormhole.sol";
 import "./Policy.sol";
 import "./libraries/BytesLib.sol";
 import "./interfaces/ITokenBridge.sol";
+import "./interfaces/IWormholeRelayer.sol";
+import "./interfaces/IWormholeReceiver.sol";
 import "./interfaces/ICircleIntegration.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-contract WormholeBridge is Policy {
+contract WormholeBridge is Policy, IWormholeReceiver {
     using SafeERC20 for IERC20;
     using BytesLib for bytes;
 
     uint32 private NONCE;
     uint8 public constant CONSISTENCY_LEVEL = 200;
+    uint256 public constant GAS_LIMIT = 1_000_000;
     uint64 private minSequence = 0;
     /**
      * Message timeout in seconds: Time out needs to account for:
@@ -30,9 +33,10 @@ contract WormholeBridge is Policy {
 
     IWormhole public immutable wormhole;
     ITokenBridge public immutable tokenBridge;
+    IWormholeRelayer public immutable relayer;
     ICircleIntegration public immutable circleIntegration;
     mapping(address => mapping (address => uint256)) locked;
-    mapping(uint16 => bytes32) messageSender;
+    mapping(uint16 => bytes32) registeredSenders;
 
     struct Message {
         uint8 payloadID;
@@ -45,29 +49,42 @@ contract WormholeBridge is Policy {
     }
 
     event TransferToken(address indexed token, uint256 amount);
+    event ReceiveMessage(address sender, uint16 sourceChain, bytes32 sourceAddress);
 
-    constructor(address _wormhole, address _tokenBridge, address _circleIntegration) Policy() {
+    constructor(address _wormhole, address _tokenBridge, address _wormholeRelayer, address _circleIntegration) Policy() {
         require(_wormhole != address(0), "ZA");
         wormhole = IWormhole(_wormhole);
         require(_tokenBridge != address(0), "ZA");
         tokenBridge = ITokenBridge(_tokenBridge);
-        require(_circleIntegration != address(0), "ZA");
+        relayer = IWormholeRelayer(_wormholeRelayer);
         circleIntegration = ICircleIntegration(_circleIntegration);
         NONCE = 0;
     }
 
-    function updateSenderAddress(uint16 _chainId, bytes32 _senderAddress) external onlyPolicy {
-        messageSender[_chainId] = _senderAddress;
+    modifier onlyRelayer() {
+        require(msg.sender == address(relayer), "Not relayer");
+        _;
     }
 
-    function sendMessage(
+    // Modifier to check if the sender is registered for the source chain
+    modifier isRegisteredSender(uint16 sourceChain, bytes32 sourceAddress) {
+        require(registeredSenders[sourceChain] == sourceAddress, "Not registered sender");
+        _;
+    }
+
+    // Function to register the valid sender address for a specific chain
+    function registerSender(uint16 sourceChain, bytes32 sourceAddress) external onlyPolicy {
+        registeredSenders[sourceChain] = sourceAddress;
+    }
+
+    function sendMessageToSolana(
         address _bettingToken,
         uint64 _amount,
         uint64 _marketId,
         uint64 _answerId
     ) external payable returns(uint64 sequence) {
         uint256 messageFee = wormhole.messageFee();
-        require(msg.value >= messageFee, "Invalid msg value");
+        require(msg.value >= messageFee, "Insufficient funds for cross-chain delivery");
         IERC20(_bettingToken).safeTransferFrom(msg.sender, address(this), _amount);
         locked[msg.sender][_bettingToken] = _amount;
         bytes memory messagePayload = abi.encodePacked(
@@ -97,10 +114,10 @@ contract WormholeBridge is Policy {
         );
     }
 
-    function receiveMessage(bytes calldata _whMessage) external payable {
+    function receiveSolanaMessage(bytes calldata _whMessage) external payable {
         (IWormhole.VM memory vm, bool valid, string memory reason) = wormhole.parseAndVerifyVM(_whMessage);
         require(valid, reason);
-        require(messageSender[vm.emitterChainId] == vm.emitterAddress, "Invalid Emitter Address!");
+        require(registeredSenders[vm.emitterChainId] == vm.emitterAddress, "Invalid Emitter Address!");
 
         /**
          * Ensure that the sequence field in the VAA is strictly monotonically increasing. This also acts as
@@ -129,6 +146,46 @@ contract WormholeBridge is Policy {
         IERC20(bettingToken).safeTransfer(voter, amount);
         emit TransferToken(bettingToken, amount);
     }
+
+    function sendMessageToEvm(
+        address _bettingToken,
+        uint256 _amount,
+        uint256 _marketId,
+        uint256 _answerId,
+        uint256 _bettingKey,
+        uint16 targetChain,
+        address targetAddress    
+    ) external payable {
+        (uint256 cost, ) = relayer.quoteEVMDeliveryPrice(targetChain, 0, GAS_LIMIT); // Dynamically calculate the cross-chain cost
+        require(msg.value >= cost, "Insufficient funds for cross-chain delivery");
+
+        bytes memory messagePayload = abi.encode(
+            _marketId,
+            _answerId,
+            _bettingKey,
+            block.timestamp,
+            bytes32(bytes20(_bettingToken)),
+            _amount
+        );
+        relayer.sendPayloadToEvm{value: cost}(
+            targetChain,
+            targetAddress,
+            abi.encode(messagePayload, msg.sender), // Payload contains the message and sender address
+            0, // No receiver value needed
+            GAS_LIMIT // Gas limit for the transaction
+        );
+    }
+
+    function receiveWormholeMessages(
+    bytes memory payload,
+    bytes[] memory,
+    bytes32 sourceAddress,
+    uint16 sourceChain,
+    bytes32
+  ) external payable onlyRelayer isRegisteredSender(sourceChain, sourceAddress) {
+    (, bytes32 voter, , , , , , , ) = abi.decode(payload, (uint256, bytes32, uint256, uint256, uint256, uint256, uint256, bytes32, uint256));
+    emit ReceiveMessage(address(uint160(uint256(voter))), sourceChain, sourceAddress);
+  }
 
     function transferCrossChain(
         address _recipient, 
@@ -168,7 +225,7 @@ contract WormholeBridge is Policy {
         );
         uint256 amountTransferred = transfer.amount;
 
-        require(messageSender[vm.emitterChainId] == vm.emitterAddress, "Invalid Emitter Address!");
+        require(registeredSenders[vm.emitterChainId] == vm.emitterAddress, "Invalid Emitter Address!");
 
         TokenTransfer memory payload = decodePayload(
             transfer.payload
@@ -193,6 +250,9 @@ contract WormholeBridge is Policy {
         require(index == encodedMessage.length, "invalid payload length");
     }
 
+    function quoteEVMDeliveryCost(uint16 targetChain) external view returns(uint256 cost) {
+        (cost, ) = relayer.quoteEVMDeliveryPrice(targetChain, 0, GAS_LIMIT);
+    }
     function getMessageFee() external view returns(uint256) {
         return wormhole.messageFee();
     }

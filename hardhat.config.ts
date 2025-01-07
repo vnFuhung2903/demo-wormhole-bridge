@@ -1,5 +1,6 @@
 import { HardhatUserConfig } from "hardhat/config";
 import "@nomicfoundation/hardhat-toolbox";
+import "hardhat-deploy";
 import * as dotenv from "dotenv";
 
 dotenv.config();
@@ -46,7 +47,7 @@ const config: HardhatUserConfig = {
     cchainFuji: {
       url: `https://avalanche-fuji.infura.io/v3/${process.env.INFURA_KEY!}`,
       chainId: 43113,
-      gasPrice: 3e10,
+      gasPrice: 1e9,
       accounts: [
         `0x${PRIVATE_KEY}`,
       ]
@@ -54,7 +55,7 @@ const config: HardhatUserConfig = {
     arbSepolia: {
       url: `https://arbitrum-sepolia.infura.io/v3/${process.env.INFURA_KEY}`,
       chainId: 421614,
-      gasPrice: 2e8,
+      gasPrice: 3e9,
       accounts: [
         `0x${PRIVATE_KEY}`,
       ]
@@ -66,7 +67,16 @@ const config: HardhatUserConfig = {
       accounts: [
         `0x${PRIVATE_KEY}`,
       ]
-    }
+    },
+    bscTestnet: {
+      url: "https://bsc-testnet.publicnode.com",
+      chainId: 97,
+      gasPrice: 4e9,
+      gas: 2e7,
+      accounts: [
+        `0x${PRIVATE_KEY}`,
+      ]
+    },
   }
 };
 

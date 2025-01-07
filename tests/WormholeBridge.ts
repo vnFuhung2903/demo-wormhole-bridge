@@ -42,7 +42,7 @@ describe("WormholeBridge", function () {
     
     let [msgId] = await chain.parseTransaction('5RGcTecUBDQUa18Q2b1yRZYamYYhswwP4Fb93rn933Yu9mHFyikLKk94mjUfghycuAAEHipYiCoBXkm4MPYFDkLF');
     let VM = await wh.getVaa(msgId, 'TokenBridge:TransferWithPayload', 1000000);
-    const tx = await contract.updateSenderAddress(chain.config.chainId, VM!.emitterAddress.toUint8Array());
+    const tx = await contract.registerSender(chain.config.chainId, VM!.emitterAddress.toUint8Array());
     await tx.wait();
     console.log(tx);
   })
